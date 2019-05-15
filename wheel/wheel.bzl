@@ -2,7 +2,10 @@
 
 def _generate_setup_py(ctx):
     classifiers = "[{}]".format(",".join(['"{}"'.format(i) for i in ctx.attr.classifiers]))
-    install_requires = "[{}]".format(",".join(['"{}"'.format(i) for i in ctx.attr.install_requires]))
+
+    transitive_imports = [_extract_package_name(y) for x in [dep[PyInfo].imports.to_list() for dep in ctx.attr.deps] for y in x]
+    intall_reqs = ctx.attr.install_requires + transitive_imports
+    install_requires = "[{}]".format(", ".join(['"{}"'.format(i) for i in intall_reqs]))
     setup_py = ctx.actions.declare_file("{}/setup.py".format(ctx.attr.name))
 
     # create setup.py
@@ -39,10 +42,32 @@ def _generate_manifest(ctx, package_name):
 
     return manifest
 
+def _extract_package_name(package_name):
+    pypi = package_name.replace("pypi__", "")
+    pypi_parts = pypi.split("_")
+    sanitized_parts = []
+    sanitized_version_parts = []
+    for part in pypi_parts:
+        if not part.isdigit():
+            sanitized_parts.append(part)
+        else:
+            sanitized_version_parts.append(part)
+    # Hard assumption that the package name will only contain one or more '-'
+    sanitized_pypi = "-".join(sanitized_parts)
+    sanitized_version = ".".join(sanitized_version_parts)
+    return "==".join([sanitized_pypi, sanitized_version])
+
+
 def _bdist_wheel_impl(ctx):
     # use the rule name in the work dir path in case multiple wheels are declared in the same BUILD file
     work_dir = "{}/wheel".format(ctx.attr.name)
     build_file_dir = ctx.build_file_path.rstrip("/BUILD")
+
+    transitive_srcs = [y for x in [dep[PyInfo].transitive_sources.to_list() for dep in ctx.attr.deps] for y in x]
+    filtered_srcs = []
+    for transitive_src in transitive_srcs:
+        if not transitive_src.path.startswith("external"):
+            filtered_srcs.append(transitive_src)
 
     package_dir = ctx.actions.declare_directory(work_dir)
     package_name = package_dir.dirname.split("/")[-1]
@@ -57,7 +82,8 @@ def _bdist_wheel_impl(ctx):
     setup_py = _generate_setup_py(ctx)
     manifest = _generate_manifest(ctx, package_name)
 
-    source_list = " ".join([src.path for src in ctx.files.srcs])
+    srcs = ctx.files.srcs + filtered_srcs
+    source_list = " ".join([src.path for src in srcs])
 
     ctx.actions.run_shell(
         mnemonic = "CreateWorkDir",
@@ -67,7 +93,7 @@ def _bdist_wheel_impl(ctx):
     )
 
     command = "chmod 0775 {package_dir} " + \
-              "&& rsync -R {source_list} {package_dir} " + \
+              "&& rsync --copy-links -R {source_list} {package_dir} " + \
               "&& cp {setup_py_path} {setup_py_dest_dir} " + \
               "&& cp {manifest_path} {setup_py_dest_dir} " + \
               "&& cd {setup_py_dest_dir} " + \
@@ -76,7 +102,7 @@ def _bdist_wheel_impl(ctx):
     ctx.actions.run_shell(
         mnemonic = "BuildWheel",
         outputs = [ctx.outputs.wheel],
-        inputs = ctx.files.srcs + [package_dir, setup_py, manifest],
+        inputs = ctx.files.srcs + [package_dir, setup_py, manifest] + filtered_srcs,
         command = command.format(
             source_list = source_list,
             setup_py_path = setup_py.path,
@@ -96,6 +122,10 @@ _bdist_wheel_attrs = {
         allow_files = [".py"],
         mandatory = True,
         allow_empty = False,
+    ),
+    "deps": attr.label_list(
+        providers = [PyInfo],
+        doc = "Direct dependencies of the library",
     ),
     "strip_src_prefix": attr.string(
         doc = "Path prefix to strip from the files listed in srcs if the build rule is not in the root directory of the source files. External sources will require at least `external/` to be stripped",
